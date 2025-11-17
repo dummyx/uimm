@@ -39,4 +39,9 @@ There is currently no formal test suite; prefer small ad‑hoc scripts or REPL c
 - PRs should:
   - Summarize the change and rationale.
   - Mention any new config/env requirements.
-  - Include manual testing notes (commands run, scenarios checked).***
+  - Include manual testing notes (commands run, scenarios checked).
+
+## General Agent Behavior
+
+- Always solve the problem unless it is genuinely impossible to do so.
+- Do not hide problems; surface root causes clearly and address them directly.***

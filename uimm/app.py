@@ -10,10 +10,12 @@ import threading
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Any, List
+from typing import Any
 
 import numpy as np
 import sounddevice as sd
+import torch
+import torchaudio
 
 # Some dependencies still use pkg_resources, which is deprecated and emits a noisy
 # UserWarning on recent Setuptools. Suppress that specific warning.
@@ -22,15 +24,14 @@ warnings.filterwarnings(
     category=UserWarning,
     message="pkg_resources is deprecated as an API.*",
 )
-
-import librosa
-import webrtcvad
 from faster_whisper import WhisperModel
 from openai import OpenAI
 
 from .config import AudioConfig, FunConfig, LLMConfig, load_audio_config, load_fun_config, load_llm_config, load_toml_config
+from .audio_input import MicListener
+from .endpointing import VADSegmenter
 from .mcp_client import MCPAudioClient
-from .mcp_server import tool_pick_uimm_audio
+from .mcp_server import tool_get_uimm_audio_file, tool_list_uimm_audio_files, tool_pick_uimm_audio
 from .player import AudioPlayer
 
 
@@ -41,127 +42,6 @@ class Utterance:
 
 
 logger = logging.getLogger("uimm.app")
-
-
-class VADSegmenter:
-    def __init__(self, cfg: AudioConfig) -> None:
-        self.cfg = cfg
-        self.vad = webrtcvad.Vad(cfg.vad_aggressiveness)
-        self.frame_bytes = int(cfg.sample_rate * cfg.frame_duration_ms / 1000) * 2  # 16-bit mono
-        # Heuristics: require that some fraction of frames in a segment are
-        # classified as speech to avoid triggering on background noise.
-        # 0.4 is a compromise: lower values allow more segments through,
-        # higher values are stricter but can miss quiet speech.
-        self.min_speech_ratio = 0.4
-
-    def _frame_generator(self, audio: bytes) -> List[bytes]:
-        n = self.frame_bytes
-        return [audio[i : i + n] for i in range(0, len(audio), n)]
-
-    def segment(self, audio: bytes) -> List[bytes]:
-        frames = self._frame_generator(audio)
-        speech_flags = [self.vad.is_speech(f, self.cfg.sample_rate) for f in frames if len(f) == self.frame_bytes]
-        segments: List[bytes] = []
-        current: list[bytes] = []
-        current_flags: list[bool] = []
-        in_speech = False
-        silence_ms = 0
-
-        def maybe_commit_segment() -> None:
-            nonlocal current, current_flags, segments
-            if not current:
-                return
-            audio_bytes = b"".join(current)
-            duration_ms = len(audio_bytes) / 2 / self.cfg.sample_rate * 1000
-            if duration_ms < self.cfg.min_utterance_ms:
-                current = []
-                current_flags = []
-                return
-            speech_frames = sum(1 for f in current_flags if f)
-            total_frames = len(current_flags) or 1
-            ratio = speech_frames / total_frames
-            if ratio >= self.min_speech_ratio:
-                logger.debug(
-                    "Accepting segment: duration=%.1f ms, speech_ratio=%.2f (threshold=%.2f)",
-                    duration_ms,
-                    ratio,
-                    self.min_speech_ratio,
-                )
-                segments.append(audio_bytes)
-            else:
-                logger.debug(
-                    "Dropping segment: duration=%.1f ms, speech_ratio=%.2f (threshold=%.2f)",
-                    duration_ms,
-                    ratio,
-                    self.min_speech_ratio,
-                )
-            current = []
-            current_flags = []
-
-        for flag, frame in zip(speech_flags, frames):
-            if flag:
-                current.append(frame)
-                current_flags.append(True)
-                in_speech = True
-                silence_ms = 0
-            else:
-                if in_speech:
-                    silence_ms += self.cfg.frame_duration_ms
-                    current.append(frame)
-                    current_flags.append(False)
-                    if silence_ms >= self.cfg.silence_duration_ms:
-                        maybe_commit_segment()
-                        in_speech = False
-                        silence_ms = 0
-
-        if current:
-            maybe_commit_segment()
-
-        if segments:
-            logger.debug("VAD produced %d segment(s)", len(segments))
-
-        return segments
-
-
-class MicListener:
-    def __init__(self, cfg: AudioConfig, out_queue: "queue.Queue[bytes]") -> None:
-        self.cfg = cfg
-        self.out_queue = out_queue
-        self.stream: sd.InputStream | None = None
-        self.running = False
-
-    def start(self) -> None:
-        if self.running:
-            return
-        self.running = True
-        input_sr = self.cfg.input_sample_rate or self.cfg.sample_rate
-        self.stream = sd.InputStream(
-            device=self.cfg.input_device,
-            channels=1,
-            samplerate=input_sr,
-            dtype="int16",
-            blocksize=int(input_sr * self.cfg.frame_duration_ms / 1000),
-            callback=self._callback,
-        )
-        self.stream.start()
-        logger.info(
-            "MicListener started (device=%s, sample_rate=%d)",
-            self.cfg.input_device if self.cfg.input_device is not None else "default",
-            self.cfg.sample_rate,
-        )
-
-    def _callback(self, indata, frames, time_info, status) -> None:  # type: ignore[override]
-        if not self.running:
-            return
-        self.out_queue.put(bytes(indata.tobytes()))
-
-    def stop(self) -> None:
-        self.running = False
-        if self.stream is not None:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
-        logger.info("MicListener stopped")
 
 
 class STTWorker(threading.Thread):
@@ -180,7 +60,13 @@ class STTWorker(threading.Thread):
             segment = self.segment_queue.get()
             if segment is None:  # type: ignore[comparison-overlap]
                 break
+            if not segment:
+                logger.debug("Skipping empty audio segment for STT")
+                continue
             audio_np = np.frombuffer(segment, dtype=np.int16).astype(np.float32) / 32768.0
+            if audio_np.size == 0 or float(np.max(np.abs(audio_np))) < 1e-4:
+                logger.debug("Skipping near-silent audio segment for STT (max_abs=%.2e)", float(np.max(np.abs(audio_np)) if audio_np.size else 0.0))
+                continue
             segments, _ = self.model.transcribe(audio_np, language="ja", beam_size=5)
             text_parts: list[str] = []
             for seg in segments:
@@ -320,8 +206,10 @@ class LLMChat:
 
         if tool_calls:
             logger.debug("Assistant requested %d tool call(s)", len(tool_calls))
-            # Record the assistant message that requested tools.
-            self.messages.append(message.model_dump(exclude_none=True))
+            # Use a per-turn view of tool calls so we don't permanently
+            # pollute the long-term conversation history with raw tool JSON.
+            assistant_with_tools = message.model_dump(exclude_none=True)
+            tool_messages: list[dict[str, Any]] = []
 
             # Execute each tool call via MCP server.
             for tool_call in tool_calls:
@@ -331,37 +219,50 @@ class LLMChat:
                 except json.JSONDecodeError:
                     arguments = {}
 
-                logger.info("Calling MCP tool %s with args=%s", name, arguments)
-                result = self.mcp_client.call_tool(name, arguments)
+                # Route known uimm.* tools directly to in-process implementations
+                # to avoid spawning a separate MCP process for the chat companion.
+                if name == "uimm.list_uimm_audio_files":
+                    logger.info("Calling in-process tool %s with args=%s", name, arguments)
+                    try:
+                        result = asyncio.run(tool_list_uimm_audio_files(arguments.get("query")))
+                    except Exception as exc:  # pragma: no cover
+                        logger.error("In-process tool %s failed: %s", name, exc)
+                        result = None
+                elif name == "uimm.get_uimm_audio_file":
+                    logger.info("Calling in-process tool %s with args=%s", name, arguments)
+                    try:
+                        result = asyncio.run(tool_get_uimm_audio_file(arguments.get("id", "")))
+                    except Exception as exc:  # pragma: no cover
+                        logger.error("In-process tool %s failed: %s", name, exc)
+                        result = None
+                elif name == "uimm.pick_uimm_audio":
+                    logger.info("Calling in-process tool %s with args=%s", name, arguments)
+                    try:
+                        result = asyncio.run(
+                            tool_pick_uimm_audio(
+                                arguments.get("mood"),
+                                arguments.get("situation", ""),
+                                arguments.get("intensity"),
+                            )
+                        )
+                    except Exception as exc:  # pragma: no cover
+                        logger.error("In-process tool %s failed: %s", name, exc)
+                        result = None
+                else:
+                    logger.info("Calling MCP tool %s with args=%s", name, arguments)
+                    result = self.mcp_client.call_tool(name, arguments)
 
                 # Optionally trigger playback for pick_uimm_audio.
-                if name == "uimm.pick_uimm_audio":
-                    if result is None:
-                        logger.warning(
-                            "MCP tool %s returned no result; falling back to in-process picker", name
-                        )
-                        try:
-                            result = asyncio.run(
-                                tool_pick_uimm_audio(
-                                    arguments.get("mood"),
-                                    arguments.get("situation", ""),
-                                    arguments.get("intensity"),
-                                )
-                            )
-                        except Exception as exc:  # pragma: no cover
-                            logger.error("In-process audio picker failed: %s", exc)
-                            result = None
+                if name == "uimm.pick_uimm_audio" and isinstance(result, dict):
+                    primary = result.get("primary") or {}
+                    url = primary.get("audio_url")
+                    volume = primary.get("volume")
+                    if url and chaos_triggered:
+                        logger.info("Playing clip: id=%s label=%s", primary.get("id"), primary.get("label"))
+                        self.player.play_url(url, volume=volume)
 
-                    if isinstance(result, dict):
-                        primary = result.get("primary") or {}
-                        url = primary.get("audio_url")
-                        volume = primary.get("volume")
-                        if url and chaos_triggered:
-                            logger.info("Playing clip: id=%s label=%s", primary.get("id"), primary.get("label"))
-                            self.player.play_url(url, volume=volume)
-
-                # Add tool result message back into conversation.
-                self.messages.append(
+                # Add tool result message for this turn only.
+                tool_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -370,10 +271,12 @@ class LLMChat:
                     }
                 )
 
-            # Second completion: model sees tool results and responds.
+            # Second completion: model sees tool results and responds, but we only
+            # persist the final assistant message into self.messages.
+            messages_with_tools = self.messages + [assistant_with_tools] + tool_messages
             completion = self.client.chat.completions.create(
                 model=self.model,
-                messages=self.messages,
+                messages=messages_with_tools,
             )
             message = completion.choices[0].message
 
@@ -385,13 +288,18 @@ class LLMChat:
 
 
 def main() -> None:
+    interrupted = False
     parser = argparse.ArgumentParser(description="Shigure Ui chat companion (always-listening, funny SFX).")
     parser.add_argument(
         "--config",
         type=str,
         help="Path to a TOML config file. If omitted, standard locations are searched.",
     )
-    parser.add_argument("--device", type=int, help="Input device index for microphone (sounddevice).")
+    parser.add_argument(
+        "--device",
+        type=int,
+        help="Input device index for microphone (sounddevice). If omitted, uses the system default input device.",
+    )
     parser.add_argument("--sample-rate", type=int, help="Sample rate for microphone audio (default 16000).")
     parser.add_argument(
         "--stt-model",
@@ -402,7 +310,7 @@ def main() -> None:
         "--vad-aggressiveness",
         type=int,
         choices=[0, 1, 2, 3],
-        help="WebRTC VAD aggressiveness (0=least, 3=most aggressive).",
+        help="Silero VAD aggressiveness (0=most sensitive, 3=most strict).",
     )
     parser.add_argument(
         "--chaos-level",
@@ -471,20 +379,15 @@ def main() -> None:
     if args.model:
         llm_cfg.model = args.model
 
-    # Ensure processing sample rate is valid for webrtcvad (supports only 8k/16k/32k/48k).
-    supported_sample_rates = [8000, 16000, 32000, 48000]
-    if audio_cfg.sample_rate not in supported_sample_rates:
-        nearest = min(supported_sample_rates, key=lambda r: abs(r - audio_cfg.sample_rate))
+    # Silero VAD and Faster-Whisper both work best at 16 kHz.
+    if audio_cfg.sample_rate != 16000:
         logger.warning(
-            "Requested processing sample rate %d Hz is not in supported set %s; snapping to %d Hz",
+            "Using non-standard processing sample rate %d Hz; 16000 Hz is recommended for Silero VAD and STT",
             audio_cfg.sample_rate,
-            supported_sample_rates,
-            nearest,
         )
-        audio_cfg.sample_rate = nearest
 
     # Detect the highest sample rate supported by the selected input device and capture at that rate.
-    # We then downsample to audio_cfg.sample_rate (default 16 kHz) using librosa.
+    # We then downsample to audio_cfg.sample_rate (default 16 kHz) using torchaudio.
     if audio_cfg.input_sample_rate is None:
         candidate_srs = [96000, 88200, 48000, 44100, 32000, 24000, 22050, 16000, 8000]
         for sr in candidate_srs:
@@ -556,27 +459,26 @@ def main() -> None:
             return
         stt_worker.start()
 
-        buffer = b""
         input_sr = audio_cfg.input_sample_rate or audio_cfg.sample_rate
         target_sr = audio_cfg.sample_rate
         while True:
             chunk = mic_queue.get()
-            # Convert input chunk to float32 and resample down to target_sr using librosa.
+            # Convert input chunk to float32 and resample down to target_sr using torchaudio.
             if input_sr != target_sr:
                 int_data = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                waveform = torch.from_numpy(int_data).unsqueeze(0)  # (1, samples)
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    resampled = librosa.resample(int_data, orig_sr=input_sr, target_sr=target_sr)
-                chunk_bytes = (np.clip(resampled, -1.0, 1.0) * 32768.0).astype(np.int16).tobytes()
+                    resampled = torchaudio.functional.resample(waveform, orig_freq=input_sr, new_freq=target_sr)
+                resampled_np = resampled.squeeze(0).clamp(-1.0, 1.0).numpy()
+                chunk_bytes = (resampled_np * 32768.0).astype(np.int16).tobytes()
             else:
                 chunk_bytes = chunk
 
-            buffer += chunk_bytes
-            segments = segmenter.segment(buffer)
+            segments = segmenter.segment(chunk_bytes)
             if segments:
                 for seg in segments:
                     segment_queue.put(seg)
-                buffer = b""
             try:
                 utterance = utterance_queue.get_nowait()
             except queue.Empty:
@@ -584,6 +486,7 @@ def main() -> None:
             print(f"User: {utterance.transcript}")
             chat.handle_utterance(utterance.transcript)
     except KeyboardInterrupt:
+        interrupted = True
         print("\nStopping...")
         logger.info("KeyboardInterrupt received; shutting down.")
     finally:
@@ -610,6 +513,12 @@ def main() -> None:
             stt_worker.join(timeout=2.0)
         except Exception as exc:  # pragma: no cover
             logger.debug("Error while joining STT worker: %s", exc)
+        if interrupted:
+            # Some third-party libraries (audio / ML runtimes) may leave
+            # non-daemon threads running that can prevent a clean exit.
+            # After best-effort cleanup above, force the process to exit
+            # so Ctrl+C always terminates the chat companion promptly.
+            os._exit(0)
 
 
 if __name__ == "__main__":

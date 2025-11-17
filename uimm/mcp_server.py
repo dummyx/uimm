@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List
 
 import httpx
@@ -14,6 +15,8 @@ from mcp.server.stdio import stdio_server
 
 UBTN_URL = "https://leiros.cloudfree.jp/usbtn/usbtn.html"
 BASE_AUDIO_URL = "https://leiros.cloudfree.jp/usbtn/"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+HTML_CACHE_PATH = PROJECT_ROOT / ".uimm_cache" / "html" / "usbtn.html"
 
 
 @dataclass
@@ -29,10 +32,37 @@ class AudioItem:
 
 
 async def fetch_audio_items() -> List[AudioItem]:
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.get(UBTN_URL)
-        resp.raise_for_status()
-        html = resp.text
+    logger = logging.getLogger("uimm.mcp")
+
+    # Ensure cache directory exists.
+    HTML_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    html: str
+    if HTML_CACHE_PATH.is_file():
+        try:
+            html = HTML_CACHE_PATH.read_text(encoding="utf-8", errors="ignore")
+            logger.info("Loaded USBTN page from cache: %s", HTML_CACHE_PATH)
+        except OSError as exc:
+            logger.warning("Failed to read USBTN cache %s: %s; refetching", HTML_CACHE_PATH, exc)
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(UBTN_URL)
+                resp.raise_for_status()
+                html = resp.text
+            try:
+                HTML_CACHE_PATH.write_text(html, encoding="utf-8")
+                logger.info("Cached USBTN page to %s", HTML_CACHE_PATH)
+            except OSError as write_exc:  # pragma: no cover
+                logger.warning("Failed to write USBTN cache %s: %s", HTML_CACHE_PATH, write_exc)
+    else:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(UBTN_URL)
+            resp.raise_for_status()
+            html = resp.text
+        try:
+            HTML_CACHE_PATH.write_text(html, encoding="utf-8")
+            logger.info("Cached USBTN page to %s", HTML_CACHE_PATH)
+        except OSError as exc:  # pragma: no cover
+            logger.warning("Failed to write USBTN cache %s: %s", HTML_CACHE_PATH, exc)
 
     # Fast path: directly locate the JS array
     marker = "let audioResourceList = ["
@@ -90,7 +120,7 @@ async def fetch_audio_items() -> List[AudioItem]:
             )
         )
 
-    logging.getLogger("uimm.mcp").info("Parsed %d audio items from USBTN page", len(items))
+    logger.info("Parsed %d audio items from USBTN page", len(items))
     return items
 
 

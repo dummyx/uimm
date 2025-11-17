@@ -8,12 +8,12 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "faster-whisper>=1.2.1",
     "httpx>=0.28.1",
-    "librosa>=0.10.0",
     "mcp[cli]>=1.21.1",
     "openai>=2.8.0",
     "simpleaudio>=1.0.4",
     "sounddevice>=0.5.3",
-    "webrtcvad>=2.0.10",
+    "torch>=2.9.1",
+    "torchaudio>=2.9.1",
 ]
 
 [project.scripts]

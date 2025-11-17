@@ -30,7 +30,9 @@ class MCPAudioClient:
             logger.debug("Starting MCP server process: %s %s", self.command, " ".join(self.args))
             async with stdio_client(params) as (read_stream, write_stream):
                 session = ClientSession(read_stream, write_stream)
-                async with anyio.fail_after(self.timeout_seconds):
+                # anyio.fail_after is a regular (synchronous) context manager that
+                # controls a CancelScope, so it must be used with `with`, not `async with`.
+                with anyio.fail_after(self.timeout_seconds):
                     await session.initialize()
                     # Populate tool schemas (useful for validation, though not strictly required here).
                     await session.list_tools()
@@ -39,8 +41,26 @@ class MCPAudioClient:
         except TimeoutError:
             logger.warning("MCP call to %s timed out after %.1f seconds", name, self.timeout_seconds)
             return None
+        except BaseExceptionGroup as group:  # type: ignore[name-defined]
+            # anyio may raise grouped errors like "unhandled errors in a TaskGroup".
+            has_timeout = any(isinstance(exc, TimeoutError) for exc in group.exceptions)
+            has_broken = any(isinstance(exc, anyio.BrokenResourceError) for exc in group.exceptions)
+            if has_timeout and has_broken:
+                logger.warning(
+                    "MCP call to %s failed: server stdio broke and timed out; treating as unavailable",
+                    name,
+                )
+            elif has_timeout:
+                logger.warning("MCP call to %s failed with timeout inside task group", name)
+            elif has_broken:
+                logger.warning("MCP call to %s failed: server stdio resource closed unexpectedly", name)
+            else:
+                logger.error("MCP call to %s failed with grouped error: %s", name, group)
+                for idx, exc in enumerate(group.exceptions, start=1):
+                    logger.error("  [%d] %r", idx, exc)
+            return None
         except Exception as exc:  # pragma: no cover
-            logger.error("MCP call to %s failed: %s", name, exc)
+            logger.error("MCP call to %s failed: %r", name, exc)
             return None
 
     def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Any:

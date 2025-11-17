@@ -58,11 +58,11 @@ model = "gpt-4.1-mini"
 sample_rate = 16000
 stt_model = "medium"              # Faster-Whisper model name or local path
 frame_duration_ms = 30
-vad_aggressiveness = 2
+vad_aggressiveness = 2           # Silero VAD aggressiveness (0=most sensitive, 3=most strict)
 min_utterance_ms = 600
 max_utterance_ms = 15000
 silence_duration_ms = 800
-input_device = 0                  # sounddevice input device index
+# input_device = 0               # microphone device index; omit to use system default
 
 [fun]
 chaos_level = 0.4                 # base value, overridden by UIMM_CHAOS_LEVEL or --chaos-level
@@ -85,11 +85,11 @@ model = "gpt-4.1-mini"
 sample_rate = 16000
 stt_model = "medium"              # e.g. "tiny", "small", "medium", "large-v3" or local path
 frame_duration_ms = 30
-vad_aggressiveness = 2
+vad_aggressiveness = 2           # Silero VAD aggressiveness (0=most sensitive, 3=most strict)
 min_utterance_ms = 600
 max_utterance_ms = 15000
 silence_duration_ms = 800
-input_device = 0                  # sounddevice input device index
+# input_device = 0               # microphone device index; omit to use system default
 cache_dir = "./.uimm_cache/audio" # optional custom cache directory (default is project_root/.uimm_cache/audio)
 preload_all_audio = false         # set true to download all clips on startup
 
@@ -146,7 +146,7 @@ You can tweak behavior without changing environment variables:
 - `--device INT` – input device index for the microphone (see `sounddevice.query_devices()` in Python to list).  
 - `--sample-rate INT` – microphone sample rate (default 16000).  
 - `--stt-model NAME_OR_PATH` – Faster-Whisper model name or path (default `medium`).  
-- `--vad-aggressiveness {0,1,2,3}` – WebRTC VAD aggressiveness (0=least, 3=most aggressive).  
+- `--vad-aggressiveness {0,1,2,3}` – Silero VAD aggressiveness (0=most sensitive, 3=most strict).  
 - `--chaos-level FLOAT` – how often to trigger sounds (0.0–1.0), overrides `UIMM_CHAOS_LEVEL`.  
 - `--cooldown-seconds FLOAT` – minimum seconds between sounds, overrides `UIMM_COOLDOWN_SECONDS`.  
 - `--model NAME` – override `OPENAI_MODEL` (must support tools/function calling).
