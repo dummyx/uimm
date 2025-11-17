@@ -1,0 +1,24 @@
+[project]
+name = "uimm"
+version = "0.1.0"
+description = "Chat companion that reacts with Shigure Ui button sounds"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "faster-whisper>=1.2.1",
+    "httpx>=0.28.1",
+    "librosa>=0.10.0",
+    "mcp[cli]>=1.21.1",
+    "openai>=2.8.0",
+    "simpleaudio>=1.0.4",
+    "sounddevice>=0.5.3",
+    "webrtcvad>=2.0.10",
+]
+
+[project.scripts]
+uimm = "uimm.app:main"
+uimm-mcp = "uimm.mcp_server:main"
+
+[tool.uv]
+package = true
